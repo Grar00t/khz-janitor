@@ -1,6 +1,6 @@
 #requires -Version 5.1
 <#
-    KhzJanitor 1.1.0 - reclaim a bloated Windows box.
+    KhzJanitor 1.2.0 - reclaim a bloated Windows box.
 
     SAFETY CONTRACT
     ---------------
@@ -15,6 +15,7 @@ $ErrorActionPreference = 'Continue'
 $script:Root   = Join-Path $env:ProgramData 'KhzJanitor'
 $script:LogDir = Join-Path $script:Root 'logs'
 $script:Ledger = Join-Path $script:Root 'ledger.csv'
+$script:Locked = 0
 
 # ---------------------------------------------------------------- internals
 
@@ -46,14 +47,23 @@ function Test-KhzAdmin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-KhzFreeMB {
+    $letter = $env:SystemDrive.TrimEnd(':')
+    $d = Get-PSDrive -Name $letter -ErrorAction SilentlyContinue
+    if ($null -eq $d) { return 0 }
+    [int]($d.Free / 1MB)
+}
+
 function Get-KhzPathSize {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return 0L }
     if (-not (Test-Path -LiteralPath $Path)) { return 0L }
     try {
-        if (Test-Path -LiteralPath $Path -PathType Leaf) {
-            return [int64](Get-Item -LiteralPath $Path).Length
-        }
+        # C:\DumpStack.log.tmp and friends list but cannot be opened.
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($null -eq $item) { return 0L }
+        if (-not $item.PSIsContainer) { return [int64]$item.Length }
+
         $sum = Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
                 Measure-Object -Property Length -Sum
         if ($null -eq $sum -or $null -eq $sum.Sum) { return 0L }
@@ -69,6 +79,12 @@ function Format-KhzBytes {
     return "$Bytes B"
 }
 
+<#
+    Deletion is silent by design. Using -ErrorAction Stop inside a try/catch
+    still writes a TerminatingError record into the PowerShell transcript, which
+    buried the useful output in noise. Instead: delete quietly, then verify with
+    Test-Path, and count what stayed behind.
+#>
 function Clear-KhzDirectory {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -88,17 +104,26 @@ function Clear-KhzDirectory {
     $freed = 0L
     foreach ($item in $items) {
         $size = if ($item.PSIsContainer) { Get-KhzPathSize $item.FullName } else { [int64]$item.Length }
-        if ($Apply) {
-            try {
-                Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
-                $freed += $size
-            } catch { }
+
+        if (-not $Apply) { $freed += $size; continue }
+
+        Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $item.FullName) {
+            # Held open by a running process, or ACL-protected. Expected, not an error.
+            $script:Locked++
         } else {
             $freed += $size
         }
     }
 
     [pscustomobject]@{ Label = $Label; Bytes = $freed; Skipped = $false }
+}
+
+function Show-KhzLocked {
+    if ($script:Locked -gt 0) {
+        Write-Khz "    ($script:Locked items in use or protected - skipped)" 'warn'
+    }
+    $script:Locked = 0
 }
 
 function Set-KhzPolicy {
@@ -109,12 +134,12 @@ function Set-KhzPolicy {
         [string]$Type = 'DWord',
         [switch]$Apply
     )
-    if (-not $Apply) { Write-Khz "      would set $Key\$Name = $Value"; return }
+    if (-not $Apply) { Write-Khz "    would set $Key\$Name = $Value"; return }
     try {
         if (-not (Test-Path -LiteralPath $Key)) { New-Item -Path $Key -Force | Out-Null }
         New-ItemProperty -Path $Key -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
-        Write-Khz "      set $Name = $Value" 'ok'
-    } catch { Write-Khz "      failed $Name : $($_.Exception.Message)" 'err' }
+        Write-Khz "    set $Name = $Value" 'ok'
+    } catch { Write-Khz "    failed $Name : $($_.Exception.Message)" 'err' }
 }
 
 # ---------------------------------------------------------------- 1. logs
@@ -123,6 +148,7 @@ function Clear-KhzLogs {
     [CmdletBinding()] param([switch]$Apply, [int]$KeepDays = 3, [switch]$ClearEventLogs)
 
     Write-Khz "`n[1] logs" 'head'
+    $script:Locked = 0
     $total = 0L
 
     $targets = @(
@@ -144,7 +170,9 @@ function Clear-KhzLogs {
         @{ P = "$env:LOCALAPPDATA\D3DSCache";                           L = 'D3D shader cache';   D = 0 },
         @{ P = "$env:LOCALAPPDATA\NVIDIA\DXCache";                      L = 'NVIDIA DX cache';    D = 0 },
         @{ P = "$env:LOCALAPPDATA\NVIDIA\GLCache";                      L = 'NVIDIA GL cache';    D = 0 },
-        @{ P = "$env:LOCALAPPDATA\AMD\DxCache";                         L = 'AMD DX cache';       D = 0 }
+        @{ P = "$env:LOCALAPPDATA\AMD\DxCache";                         L = 'AMD DX cache';       D = 0 },
+        @{ P = "$env:LOCALAPPDATA\JetBrains\JetLogs";                   L = 'JetBrains logs';     D = 0 },
+        @{ P = "$env:SystemRoot\Temp\JetLogs";                          L = 'JetBrains ETW logs'; D = 0 }
     )
 
     foreach ($t in $targets) {
@@ -155,8 +183,7 @@ function Clear-KhzLogs {
         $total += $r.Bytes
     }
 
-    foreach ($dump in @("$env:SystemRoot\MEMORY.DMP", "$env:SystemRoot\Minidump", "$env:SystemDrive\DumpStack.log.tmp")) {
-        if (-not (Test-Path -LiteralPath $dump)) { continue }
+    foreach ($dump in @("$env:SystemRoot\MEMORY.DMP", "$env:SystemRoot\Minidump")) {
         $size = Get-KhzPathSize $dump
         if ($size -le 0) { continue }
         Write-Khz ('    {0,-22} {1}' -f (Split-Path $dump -Leaf), (Format-KhzBytes $size))
@@ -168,7 +195,8 @@ function Clear-KhzLogs {
         if ($Apply) {
             $n = 0
             foreach ($log in @(wevtutil el 2>$null)) {
-                try { wevtutil cl "$log" 2>$null; $n++ } catch { }
+                wevtutil cl "$log" 2>$null
+                $n++
             }
             Write-Khz "    event logs cleared: $n" 'ok'
         } else {
@@ -176,6 +204,7 @@ function Clear-KhzLogs {
         }
     }
 
+    Show-KhzLocked
     $total
 }
 
@@ -185,19 +214,19 @@ function Clear-KhzCaches {
     [CmdletBinding()] param([switch]$Apply, [switch]$IncludePackageCaches)
 
     Write-Khz "`n[2] caches" 'head'
+    $script:Locked = 0
     $total = 0L
 
-    # ---- Chromium family, per browser, with a correct per-root subtotal
     $chromium = [ordered]@{
-        'Edge'   = "$env:LOCALAPPDATA\Microsoft\Edge\User Data"
-        'Chrome' = "$env:LOCALAPPDATA\Google\Chrome\User Data"
-        'Brave'  = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"
-        'Vivaldi'= "$env:LOCALAPPDATA\Vivaldi\User Data"
+        'Edge'    = "$env:LOCALAPPDATA\Microsoft\Edge\User Data"
+        'Chrome'  = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+        'Brave'   = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"
+        'Vivaldi' = "$env:LOCALAPPDATA\Vivaldi\User Data"
     }
     $leaves = @(
         'Cache', 'Code Cache', 'GPUCache', 'DawnCache', 'DawnGraphiteCache',
         'GrShaderCache', 'ShaderCache', 'Service Worker\CacheStorage',
-        'Service Worker\ScriptCache', 'Storage\ext', 'IndexedDB\https_copilot*'
+        'Service Worker\ScriptCache', 'Storage\ext'
     )
 
     foreach ($name in $chromium.Keys) {
@@ -210,13 +239,9 @@ function Clear-KhzCaches {
 
         foreach ($prof in $profileDirs) {
             foreach ($leaf in $leaves) {
-                if ($leaf -like '*`**') { continue }
-                $p = Join-Path $prof.FullName $leaf
-                $rootBytes += (Clear-KhzDirectory -Path $p -Apply:$Apply).Bytes
+                $rootBytes += (Clear-KhzDirectory -Path (Join-Path $prof.FullName $leaf) -Apply:$Apply).Bytes
             }
         }
-
-        # shared, profile-independent
         foreach ($shared in @('ShaderCache', 'GrShaderCache', 'component_crx_cache', 'GraphiteDawnCache')) {
             $rootBytes += (Clear-KhzDirectory -Path (Join-Path $root $shared) -Apply:$Apply).Bytes
         }
@@ -225,13 +250,8 @@ function Clear-KhzCaches {
         $total += $rootBytes
     }
 
-    # ---- Firefox uses a different layout entirely
-    $ffRoots = @(
-        "$env:LOCALAPPDATA\Mozilla\Firefox\Profiles",
-        "$env:APPDATA\Mozilla\Firefox\Profiles"
-    )
     $ffBytes = 0L
-    foreach ($ffRoot in $ffRoots) {
+    foreach ($ffRoot in @("$env:LOCALAPPDATA\Mozilla\Firefox\Profiles", "$env:APPDATA\Mozilla\Firefox\Profiles")) {
         if (-not (Test-Path -LiteralPath $ffRoot)) { continue }
         foreach ($prof in @(Get-ChildItem -LiteralPath $ffRoot -Directory -ErrorAction SilentlyContinue)) {
             foreach ($leaf in @('cache2', 'startupCache', 'shader-cache', 'thumbnails', 'OfflineCache')) {
@@ -244,25 +264,27 @@ function Clear-KhzCaches {
         $total += $ffBytes
     }
 
-    # ---- everything else
     $misc = @(
-        @{ P = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer";               L = 'thumbnail cache' },
-        @{ P = "$env:LOCALAPPDATA\Microsoft\Windows\INetCache";              L = 'INetCache' },
-        @{ P = "$env:LOCALAPPDATA\Microsoft\Terminal Server Client\Cache";   L = 'RDP cache' },
-        @{ P = "$env:LOCALAPPDATA\Microsoft\Office\16.0\OfficeFileCache";    L = 'Office cache' },
-        @{ P = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Crashpad";        L = 'Edge crashpad' },
-        @{ P = "$env:LOCALAPPDATA\Microsoft\VisualStudio\Packages\_Instances"; L = 'VS instances' },
-        @{ P = "$env:LOCALAPPDATA\Microsoft\VSApplicationInsights";          L = 'VS telemetry' },
-        @{ P = "$env:LOCALAPPDATA\JetBrains\Transient";                      L = 'JetBrains transient' },
-        @{ P = "$env:LOCALAPPDATA\JetBrains\caches";                         L = 'JetBrains caches' },
-        @{ P = "$env:APPDATA\Code\CachedData";                               L = 'VS Code cached data' },
-        @{ P = "$env:APPDATA\Code\Cache";                                    L = 'VS Code cache' },
-        @{ P = "$env:APPDATA\Code\CachedExtensionVSIXs";                     L = 'VS Code vsix cache' },
-        @{ P = "$env:USERPROFILE\.dotnet\optimizationdata";                  L = 'dotnet opt data' },
-        @{ P = "$env:USERPROFILE\.templateengine";                           L = 'dotnet templates' },
-        @{ P = "$env:ProgramData\Microsoft\Network\Downloader";              L = 'delivery optimization' },
-        @{ P = "$env:ProgramData\Docker\log";                                L = 'Docker logs' },
-        @{ P = "$env:LOCALAPPDATA\Docker\log";                               L = 'Docker user logs' }
+        @{ P = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer";                 L = 'thumbnail cache' },
+        @{ P = "$env:LOCALAPPDATA\Microsoft\Windows\INetCache";                L = 'INetCache' },
+        @{ P = "$env:LOCALAPPDATA\Microsoft\Terminal Server Client\Cache";     L = 'RDP cache' },
+        @{ P = "$env:LOCALAPPDATA\Microsoft\Office\16.0\OfficeFileCache";      L = 'Office cache' },
+        @{ P = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Crashpad";          L = 'Edge crashpad' },
+        @{ P = "$env:LOCALAPPDATA\Microsoft\VSApplicationInsights";            L = 'VS telemetry' },
+        @{ P = "$env:LOCALAPPDATA\JetBrains\Transient";                        L = 'JetBrains transient' },
+        @{ P = "$env:LOCALAPPDATA\JetBrains\caches";                           L = 'JetBrains caches' },
+        @{ P = "$env:APPDATA\Code\CachedData";                                 L = 'VS Code cached data' },
+        @{ P = "$env:APPDATA\Code\Cache";                                      L = 'VS Code cache' },
+        @{ P = "$env:APPDATA\Code\CachedExtensionVSIXs";                       L = 'VS Code vsix cache' },
+        @{ P = "$env:APPDATA\Notion\Cache";                                    L = 'Notion cache' },
+        @{ P = "$env:APPDATA\Notion\Code Cache";                               L = 'Notion code cache' },
+        @{ P = "$env:APPDATA\Notion\GPUCache";                                 L = 'Notion GPU cache' },
+        @{ P = "$env:USERPROFILE\.dotnet\optimizationdata";                    L = 'dotnet opt data' },
+        @{ P = "$env:USERPROFILE\.templateengine";                             L = 'dotnet templates' },
+        @{ P = "$env:ProgramData\Microsoft\Network\Downloader";                L = 'delivery optimization' },
+        @{ P = "$env:ProgramData\Docker\log";                                  L = 'Docker logs' },
+        @{ P = "$env:LOCALAPPDATA\Docker\log";                                 L = 'Docker user logs' },
+        @{ P = "$env:LOCALAPPDATA\Google\DriveFS\Logs";                        L = 'Google Drive logs' }
     )
 
     foreach ($m in $misc) {
@@ -282,7 +304,8 @@ function Clear-KhzCaches {
             @{ P = "$env:LOCALAPPDATA\pip\Cache";         L = 'pip cache' },
             @{ P = "$env:LOCALAPPDATA\Yarn\Cache";        L = 'yarn cache' },
             @{ P = "$env:USERPROFILE\.cargo\registry";    L = 'cargo registry' },
-            @{ P = "$env:USERPROFILE\.gradle\caches";     L = 'gradle caches' }
+            @{ P = "$env:USERPROFILE\.gradle\caches";     L = 'gradle caches' },
+            @{ P = "$env:LOCALAPPDATA\Android\Sdk\system-images"; L = 'android system images' }
         )) {
             $r = Clear-KhzDirectory -Path $pkg.P -Label $pkg.L -Apply:$Apply
             if ($r.Bytes -gt 0) { Write-Khz ('    {0,-22} {1}' -f $r.Label, (Format-KhzBytes $r.Bytes)) }
@@ -290,7 +313,6 @@ function Clear-KhzCaches {
         }
     }
 
-    # ---- build output under the dev tree: the biggest win on a build box
     foreach ($devRoot in @((Join-Path $env:USERPROFILE 'dev'), (Join-Path $env:USERPROFILE 'source'))) {
         if (-not (Test-Path -LiteralPath $devRoot)) { continue }
         $stale = @(Get-ChildItem -LiteralPath $devRoot -Directory -Recurse -Force -ErrorAction SilentlyContinue |
@@ -306,6 +328,7 @@ function Clear-KhzCaches {
         $total += $devBytes
     }
 
+    Show-KhzLocked
     $total
 }
 
@@ -315,13 +338,11 @@ function Remove-KhzEdgeExtensions {
     [CmdletBinding()] param([switch]$Apply, [switch]$BlockFutureInstalls)
 
     Write-Khz "`n[3] Edge extensions" 'head'
+    $script:Locked = 0
     $total = 0L
     $root = "$env:LOCALAPPDATA\Microsoft\Edge\User Data"
 
-    if (-not (Test-Path -LiteralPath $root)) {
-        Write-Khz '    Edge not installed' 'warn'
-        return 0L
-    }
+    if (-not (Test-Path -LiteralPath $root)) { Write-Khz '    Edge not installed' 'warn'; return 0L }
 
     if ($Apply) {
         Get-Process msedge, msedgewebview2 -ErrorAction SilentlyContinue |
@@ -347,9 +368,8 @@ function Remove-KhzEdgeExtensions {
     }
 
     foreach ($id in ($seen.Keys | Sort-Object { -1 * $seen[$_] })) {
-        Write-Khz ('    {0}  x{1} profiles' -f $id, $seen[$id])
+        Write-Khz ('    {0}  x{1}' -f $id, $seen[$id])
     }
-
     Write-Khz ('    {0} unique extensions across {1} profiles, {2}' -f
         (Get-KhzCount $seen.Keys), (Get-KhzCount $profileDirs), (Format-KhzBytes $total)) 'ok'
 
@@ -358,6 +378,7 @@ function Remove-KhzEdgeExtensions {
                       -Name '1' -Value '*' -Type String -Apply:$Apply
     }
 
+    Show-KhzLocked
     $total
 }
 
@@ -367,7 +388,6 @@ function Disable-KhzCopilot {
     [CmdletBinding()] param([switch]$Apply)
 
     Write-Khz "`n[4] Copilot, Edge sidebar, ads" 'head'
-
     if (-not (Test-KhzAdmin)) { Write-Khz '    needs admin - policies skipped' 'warn'; return 0L }
 
     $pol = @(
@@ -379,24 +399,24 @@ function Disable-KhzCopilot {
         @{ K = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge';                   N = 'StartupBoostEnabled';         V = 0 },
         @{ K = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge';                   N = 'BackgroundModeEnabled';       V = 0 },
         @{ K = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge';                   N = 'BingAdsSuppression';          V = 1 },
-        @{ K = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge';                   N = 'CopilotPageContext';          V = 0 },
-        @{ K = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive';               N = 'DisableFileSyncNGSC';         V = 0 }
+        @{ K = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge';                   N = 'CopilotPageContext';          V = 0 }
     )
     foreach ($p in $pol) { Set-KhzPolicy -Key $p.K -Name $p.N -Value $p.V -Apply:$Apply }
 
     $user = @(
-        @{ K = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';        N = 'ShowCopilotButton'; V = 0 },
-        @{ K = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager';   N = 'SilentInstalledAppsEnabled'; V = 0 },
-        @{ K = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager';   N = 'SubscribedContent-338388Enabled'; V = 0 },
-        @{ K = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager';   N = 'SystemPaneSuggestionsEnabled'; V = 0 }
+        @{ K = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';      N = 'ShowCopilotButton'; V = 0 },
+        @{ K = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N = 'SilentInstalledAppsEnabled'; V = 0 },
+        @{ K = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N = 'SubscribedContent-338388Enabled'; V = 0 },
+        @{ K = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N = 'SystemPaneSuggestionsEnabled'; V = 0 }
     )
     foreach ($p in $user) { Set-KhzPolicy -Key $p.K -Name $p.N -Value $p.V -Apply:$Apply }
 
     # OneDrive is deliberately NOT in this list: it may hold synced work files.
     $appx = @('*Copilot*', '*BingSearch*', '*XboxGamingOverlay*', '*XboxGameOverlay*',
-              '*GamingApp*', '*ZuneMusic*', '*ZuneVideo*', '*QuickAssist*',
-              '*MicrosoftStickyNotes*', '*Clipchamp*', '*WindowsFeedbackHub*',
-              '*GetHelp*', '*MicrosoftSolitaireCollection*')
+              '*XboxSpeechToTextOverlay*', '*GamingApp*', '*ZuneMusic*', '*ZuneVideo*',
+              '*QuickAssist*', '*MicrosoftStickyNotes*', '*Clipchamp*',
+              '*WindowsFeedbackHub*', '*GetHelp*', '*MicrosoftSolitaireCollection*',
+              '*BingWeather*', '*BingNews*', '*People*', '*windowscommunicationsapps*')
 
     foreach ($pattern in $appx) {
         foreach ($pkg in @(Get-AppxPackage -Name $pattern -ErrorAction SilentlyContinue)) {
@@ -410,7 +430,6 @@ function Disable-KhzCopilot {
             }
         }
     }
-
     0L
 }
 
@@ -440,37 +459,30 @@ function Remove-KhzStaleModules {
 
     $total = 0L
     $removed = 0
-    $groups = @($all | Group-Object Name)
-
-    foreach ($g in $groups) {
+    foreach ($g in @($all | Group-Object Name)) {
         $name = $g.Name
         if (@($protected | Where-Object { $name -like $_ }).Count -gt 0) { continue }
 
         $versions = @($g.Group | Sort-Object Version -Descending)
         $doomed = if ($OldVersionsOnly -or ($Keep -contains $name)) {
             @($versions | Select-Object -Skip 1)
-        } else {
-            $versions
-        }
+        } else { $versions }
 
         foreach ($v in $doomed) {
             $size = Get-KhzPathSize $v.ModuleBase
             $total += $size
             $removed++
-            if ($Apply) {
-                try {
-                    Remove-Item -LiteralPath $v.ModuleBase -Recurse -Force -ErrorAction Stop
-                    Write-Khz ('    removed {0} {1}  {2}' -f $name, $v.Version, (Format-KhzBytes $size)) 'ok'
-                } catch {
-                    Write-Khz ('    locked  {0} {1}' -f $name, $v.Version) 'warn'
-                }
+            if (-not $Apply) { continue }
+            Remove-Item -LiteralPath $v.ModuleBase -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $v.ModuleBase) {
+                Write-Khz ('    locked  {0} {1}' -f $name, $v.Version) 'warn'
+            } else {
+                Write-Khz ('    removed {0} {1}  {2}' -f $name, $v.Version, (Format-KhzBytes $size)) 'ok'
             }
         }
     }
 
-    Write-Khz ('    {0} module folders, {1} total, {2} module names' -f
-        $removed, (Format-KhzBytes $total), (Get-KhzCount $groups)) 'ok'
-    if (-not $Apply) { Write-Khz '    (dry run - list suppressed, use -Verbose for detail)' }
+    Write-Khz ('    {0} module folders, {1}' -f $removed, (Format-KhzBytes $total)) 'ok'
     $total
 }
 
@@ -486,11 +498,10 @@ function Disable-KhzTelemetry {
         $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
         if (-not $s) { continue }
         if ($Apply) {
-            try {
-                Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
-                Set-Service -Name $svc -StartupType Disabled -ErrorAction Stop
-                Write-Khz "    disabled $svc" 'ok'
-            } catch { Write-Khz "    could not disable $svc" 'warn' }
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+            $now = (Get-Service -Name $svc -ErrorAction SilentlyContinue).StartType
+            Write-Khz "    $svc -> $now" 'ok'
         } else {
             Write-Khz "    would disable $svc (now: $($s.Status))"
         }
@@ -511,8 +522,7 @@ function Disable-KhzTelemetry {
     foreach ($t in $tasks) {
         $leaf = Split-Path $t -Leaf
         $path = (Split-Path $t -Parent) + '\'
-        $task = Get-ScheduledTask -TaskName $leaf -TaskPath $path -ErrorAction SilentlyContinue
-        if (-not $task) { continue }
+        if (-not (Get-ScheduledTask -TaskName $leaf -TaskPath $path -ErrorAction SilentlyContinue)) { continue }
         if ($Apply) {
             Disable-ScheduledTask -TaskName $leaf -TaskPath $path -ErrorAction SilentlyContinue | Out-Null
             Write-Khz "    disabled task $leaf" 'ok'
@@ -531,9 +541,12 @@ function Disable-KhzTelemetry {
 <#
     'The paging file is too small for this operation to complete' does NOT mean
     the pagefile is missing. It means the commit limit - physical RAM plus the
-    pagefile maximum - was reached. A fixed 4096 MB pagefile on an 8 GB machine
-    caps the commit limit at about 12 GB, which one Docker daemon plus a
-    compiler plus a browser will exhaust. This sizes it against installed RAM.
+    pagefile maximum - was reached.
+
+    Win32_PageFileSetting reports 'A general error occurred that is not covered
+    by a more specific error code' when InitialSize does not fit in the free
+    space on the volume. Asking for 8192 MB with 1.1 GB free fails with exactly
+    that message. So: measure free space first, clamp, and say so out loud.
 #>
 function Repair-KhzPagefile {
     [CmdletBinding()] param(
@@ -545,45 +558,58 @@ function Repair-KhzPagefile {
 
     Write-Khz "`n[7] virtual memory" 'head'
 
-    $cs  = Get-CimInstance Win32_ComputerSystem
-    $os  = Get-CimInstance Win32_OperatingSystem
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $os = Get-CimInstance Win32_OperatingSystem
     $ramGB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
 
     $usage = @(Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue)
     $currentMB = if ((Get-KhzCount $usage) -gt 0) { $usage[0].AllocatedBaseSize } else { 0 }
     $peakMB    = if ((Get-KhzCount $usage) -gt 0) { $usage[0].PeakUsage } else { 0 }
 
-    $commitLimitGB = [math]::Round(($os.TotalVirtualMemorySize) / 1MB, 1)
-    $commitUsedGB  = [math]::Round(($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / 1MB, 1)
+    $limitGB = [math]::Round($os.TotalVirtualMemorySize / 1MB, 1)
+    $usedGB  = [math]::Round(($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / 1MB, 1)
+    $freeMB  = Get-KhzFreeMB
 
     Write-Khz "    physical RAM       : $ramGB GB"
     Write-Khz "    pagefile           : $currentMB MB (peak $peakMB MB)"
     Write-Khz "    automatic managed  : $($cs.AutomaticManagedPagefile)"
-    Write-Khz "    commit limit       : $commitLimitGB GB, in use $commitUsedGB GB"
+    Write-Khz "    commit limit       : $limitGB GB, in use $usedGB GB"
+    Write-Khz "    free disk          : $([math]::Round($freeMB/1024,2)) GB"
 
-    # Target: enough headroom that a compiler, Docker and a browser coexist.
-    if ($InitialMB -le 0) { $InitialMB = [int]([math]::Max(8192, $ramGB * 1024)) }
-    if ($MaximumMB -le 0) { $MaximumMB = [int]([math]::Max(24576, $ramGB * 1024 * 3)) }
+    $headroomGB = [math]::Round($limitGB - $usedGB, 1)
+    if ($headroomGB -lt 3) {
+        Write-Khz "    commit headroom    : $headroomGB GB - this is why tools die" 'err'
+    }
 
-    $needsWork = $currentMB -lt $InitialMB
+    if ($InitialMB -le 0) { $InitialMB = [int][math]::Max(4096, $ramGB * 1024) }
+    if ($MaximumMB -le 0) { $MaximumMB = [int][math]::Max(16384, $ramGB * 1024 * 3) }
 
-    if (-not $needsWork) {
-        Write-Khz '    already sized adequately' 'ok'
+    # The pagefile is allocated eagerly at InitialSize. Leave 2 GB breathing room.
+    $budgetMB = $freeMB - 2048
+    if ($InitialMB -gt $budgetMB) {
+        Write-Khz "    cannot allocate $InitialMB MB: only $freeMB MB free on $env:SystemDrive" 'err'
+        if ($budgetMB -lt 2048) {
+            Write-Khz '    free at least 6 GB first, then re-run this task' 'err'
+            Write-Khz '    biggest lever right now: Invoke-KhzJanitor -Tasks Components -Apply' 'warn'
+            return 0L
+        }
+        $InitialMB = [int]$budgetMB
+        Write-Khz "    clamped initial size to $InitialMB MB" 'warn'
+    }
+
+    if ($currentMB -ge $InitialMB -and -not $UseAutomatic) {
+        Write-Khz '    already at or above the size that fits on this disk' 'ok'
         return 0L
     }
 
-    Write-Khz "    RECOMMENDED        : initial $InitialMB MB, maximum $MaximumMB MB" 'warn'
-    Write-Khz "    reason             : $currentMB MB + $ramGB GB RAM is what produced" 'warn'
-    Write-Khz "                         'The paging file is too small' on this box" 'warn'
+    Write-Khz "    target             : initial $InitialMB MB, maximum $MaximumMB MB" 'warn'
 
     if (-not (Test-KhzAdmin)) { Write-Khz '    needs admin to change' 'err'; return 0L }
     if (-not $Apply) { Write-Khz '    would resize the pagefile' 'warn'; return 0L }
 
-    try {
-        if ($UseAutomatic) {
-            Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $true } -ErrorAction Stop
-            Write-Khz '    enabled automatic pagefile' 'ok'
-        } else {
+    $done = $false
+    if (-not $UseAutomatic) {
+        try {
             if ($cs.AutomaticManagedPagefile) {
                 Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $false } -ErrorAction Stop
             }
@@ -599,22 +625,32 @@ function Repair-KhzPagefile {
                 } -ErrorAction Stop | Out-Null
             }
             Write-Khz "    pagefile set to $InitialMB / $MaximumMB MB" 'ok'
+            $done = $true
+        } catch {
+            Write-Khz "    explicit sizing failed: $($_.Exception.Message)" 'warn'
+            Write-Khz '    falling back to the automatic pagefile' 'warn'
         }
-        Write-Khz '    REBOOT REQUIRED' 'err'
-    } catch {
-        Write-Khz "    failed: $($_.Exception.Message)" 'err'
     }
+
+    if (-not $done) {
+        try {
+            Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $true } -ErrorAction Stop
+            Write-Khz '    automatic pagefile enabled' 'ok'
+            $done = $true
+        } catch {
+            Write-Khz "    failed: $($_.Exception.Message)" 'err'
+            Write-Khz '    an Intune or group policy may own this setting' 'warn'
+        }
+    }
+
+    if ($done) { Write-Khz '    REBOOT REQUIRED' 'err' }
     0L
 }
 
 # ---------------------------------------------------------------- 8. memory
 
-<#
-    On a RAM-starved box the useful question is not what is on disk but what is
-    resident. This reports it and offers to trim startup entries.
-#>
 function Optimize-KhzMemory {
-    [CmdletBinding()] param([int]$Top = 12, [switch]$Apply)
+    [CmdletBinding()] param([int]$Top = 12)
 
     Write-Khz "`n[8] memory pressure" 'head'
 
@@ -624,30 +660,30 @@ function Optimize-KhzMemory {
     $usedPct = if ($totalGB -gt 0) { [math]::Round((1 - ($freeGB / $totalGB)) * 100, 1) } else { 0 }
 
     Write-Khz "    RAM $freeGB GB free of $totalGB GB  ($usedPct% used)" $(if ($usedPct -gt 85) { 'err' } else { 'info' })
+    Write-Khz ''
 
     $groups = Get-Process -ErrorAction SilentlyContinue |
               Group-Object -Property ProcessName |
               ForEach-Object {
+                  $mb = [math]::Round((($_.Group | Measure-Object WorkingSet64 -Sum).Sum) / 1MB, 1)
                   [pscustomobject]@{
                       Name = $_.Name
-                      MB   = [math]::Round((($_.Group | Measure-Object WorkingSet64 -Sum).Sum) / 1MB, 1)
+                      MB   = $mb
                       N    = (Get-KhzCount $_.Group)
+                      Pct  = if ($totalGB -gt 0) { [math]::Round($mb / ($totalGB * 1024) * 100, 1) } else { 0 }
                   }
               } | Sort-Object MB -Descending | Select-Object -First $Top
 
-    Write-Khz ''
     foreach ($g in $groups) {
-        Write-Khz ('    {0,-28} {1,8} MB  x{2}' -f $g.Name, $g.MB, $g.N)
+        Write-Khz ('    {0,-26} {1,8} MB  x{2,-3} {3,5}% of RAM' -f $g.Name, $g.MB, $g.N, $g.Pct)
     }
 
     $startup = @(Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue)
     Write-Khz ''
     Write-Khz ('    startup entries: {0}' -f (Get-KhzCount $startup))
     foreach ($s in $startup) {
-        Write-Khz ('      {0,-26} {1}' -f $s.Name, $s.Location)
+        Write-Khz ('      {0,-26} {1}' -f $s.Name, $s.User)
     }
-
-    0L
 }
 
 # ---------------------------------------------------------------- 9. WinSxS
@@ -659,7 +695,7 @@ function Clear-KhzComponentStore {
     if (-not (Test-KhzAdmin)) { Write-Khz '    needs admin - skipped' 'warn'; return 0L }
 
     if (-not $Apply) {
-        Write-Khz '    analysing (read-only, this takes a minute)...'
+        Write-Khz '    analysing (read-only, takes a minute)...'
         & dism.exe /Online /Cleanup-Image /AnalyzeComponentStore |
             Where-Object { $_ -match 'Size|Reclaimable|Recommended' } |
             ForEach-Object { Write-Khz "    $($_.Trim())" }
@@ -667,16 +703,148 @@ function Clear-KhzComponentStore {
         return 0L
     }
 
-    $args = @('/Online', '/Cleanup-Image', '/StartComponentCleanup')
-    if ($ResetBase) { $args += '/ResetBase' }
-    Write-Khz "    dism $($args -join ' ')"
-    & dism.exe @args | Where-Object { $_ -match 'complete|error|Error' } |
+    $before = Get-KhzFreeMB
+    $dismArgs = @('/Online', '/Cleanup-Image', '/StartComponentCleanup')
+    if ($ResetBase) { $dismArgs += '/ResetBase' }
+
+    Write-Khz "    dism $($dismArgs -join ' ')  (this can take 10+ minutes)"
+    & dism.exe @dismArgs | Where-Object { $_ -match 'complete|Error|error' } |
         ForEach-Object { Write-Khz "    $($_.Trim())" }
 
-    if ($ResetBase) {
-        Write-Khz '    /ResetBase used - installed updates can no longer be uninstalled' 'warn'
+    $gained = [int64](Get-KhzFreeMB - $before) * 1MB
+    if ($gained -gt 0) { Write-Khz "    freed $(Format-KhzBytes $gained)" 'ok' }
+    if ($ResetBase) { Write-Khz '    /ResetBase used - installed updates can no longer be uninstalled' 'warn' }
+    [math]::Max(0, $gained)
+}
+
+# ---------------------------------------------------------------- 10. bloatware
+
+function Get-KhzPrograms {
+    [CmdletBinding()] param([int]$Top = 30)
+
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+
+    $rows = foreach ($k in $keys) {
+        foreach ($e in @(Get-ItemProperty -Path $k -ErrorAction SilentlyContinue)) {
+            $name = $e.PSObject.Properties['DisplayName']
+            if ($null -eq $name -or [string]::IsNullOrWhiteSpace($name.Value)) { continue }
+            $sizeProp = $e.PSObject.Properties['EstimatedSize']
+            $unProp   = $e.PSObject.Properties['UninstallString']
+            [pscustomobject]@{
+                Name      = $name.Value
+                MB        = if ($sizeProp) { [math]::Round($sizeProp.Value / 1024, 1) } else { 0 }
+                Uninstall = if ($unProp) { $unProp.Value } else { '' }
+            }
+        }
     }
-    0L
+
+    @($rows) | Sort-Object MB -Descending | Select-Object -First $Top
+}
+
+<#
+    Removes software that has nothing to do with building code. Every pattern is
+    explicit; nothing is matched heuristically. OneDrive is excluded on purpose.
+#>
+function Remove-KhzBloatware {
+    [CmdletBinding()]
+    param(
+        [switch]$Apply,
+        [string[]]$Patterns = @(
+            'Google Drive', 'Google Update', 'Android Studio', 'Android SDK',
+            'Dropbox', 'iTunes', 'Bonjour', 'Apple Software Update',
+            'McAfee', 'Norton', 'Avast', 'Web Companion', 'Grain'
+        )
+    )
+
+    Write-Khz "`n[10] non-build software" 'head'
+    $script:Locked = 0
+    $total = 0L
+
+    foreach ($p in @(Get-KhzPrograms -Top 500)) {
+        if (@($Patterns | Where-Object { $p.Name -like "*$_*" }).Count -eq 0) { continue }
+
+        Write-Khz ('    {0,-40} {1,8} MB' -f $p.Name, $p.MB)
+        if (-not $Apply) { Write-Khz '      would uninstall' 'warn'; continue }
+        if ([string]::IsNullOrWhiteSpace($p.Uninstall)) { Write-Khz '      no uninstall string' 'warn'; continue }
+
+        if ($p.Uninstall -match 'msiexec') {
+            $guid = [regex]::Match($p.Uninstall, '\{[0-9A-Fa-f-]{36}\}').Value
+            if ($guid) {
+                Start-Process msiexec.exe -ArgumentList "/x $guid /qn /norestart" -Wait -ErrorAction SilentlyContinue
+                Write-Khz '      uninstalled (msi)' 'ok'
+            }
+        } else {
+            Write-Khz "      run manually: $($p.Uninstall)" 'warn'
+        }
+    }
+
+    # Leftover directories that survive an uninstall.
+    $dirs = @(
+        @{ P = "$env:LOCALAPPDATA\Android\Sdk";              L = 'Android SDK' },
+        @{ P = "$env:USERPROFILE\.android";                  L = 'Android AVDs' },
+        @{ P = "$env:LOCALAPPDATA\Google\DriveFS";           L = 'Google Drive cache' },
+        @{ P = "$env:LOCALAPPDATA\Google\Update";            L = 'Google Update' },
+        @{ P = "$env:LOCALAPPDATA\Google\Chrome\User Data\Crashpad"; L = 'Chrome crashpad' },
+        @{ P = "$env:ProgramData\Google";                    L = 'Google (ProgramData)' },
+        @{ P = "$env:LOCALAPPDATA\Grain";                    L = 'Grain' },
+        @{ P = "$env:APPDATA\Grain";                         L = 'Grain (roaming)' }
+    )
+    foreach ($d in $dirs) {
+        $size = Get-KhzPathSize $d.P
+        if ($size -le 0) { continue }
+        Write-Khz ('    {0,-40} {1,8}' -f $d.L, (Format-KhzBytes $size))
+        if ($Apply) {
+            Remove-Item -LiteralPath $d.P -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $d.P)) { $total += $size } else { $script:Locked++ }
+        } else { $total += $size }
+    }
+
+    Show-KhzLocked
+    $total
+}
+
+function Disable-KhzStartup {
+    [CmdletBinding()]
+    param(
+        [switch]$Apply,
+        [string[]]$Names = @(
+            'GoogleDriveFS', 'electron.app.Grain', 'MicrosoftEdgeAutoLaunch*',
+            'Mozilla-Firefox-*', 'OneDriveSetup', 'Dropbox', 'Skype', 'Teams'
+        )
+    )
+
+    Write-Khz "`n[11] startup entries" 'head'
+
+    $hives = @(
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
+    )
+
+    foreach ($hive in $hives) {
+        if (-not (Test-Path -LiteralPath $hive)) { continue }
+        $props = Get-ItemProperty -Path $hive -ErrorAction SilentlyContinue
+        if ($null -eq $props) { continue }
+
+        foreach ($prop in $props.PSObject.Properties) {
+            if ($prop.Name -like 'PS*') { continue }
+            if (@($Names | Where-Object { $prop.Name -like $_ }).Count -eq 0) { continue }
+
+            if ($Apply) {
+                Remove-ItemProperty -Path $hive -Name $prop.Name -Force -ErrorAction SilentlyContinue
+                Write-Khz "    removed $($prop.Name)" 'ok'
+            } else {
+                Write-Khz "    would remove $($prop.Name)  ($(Split-Path $hive -Leaf))"
+            }
+        }
+    }
+
+    Write-Khz '    per-service-account copies under S-1-5-18/19/20 need' 'warn'
+    Write-Khz '    the vendor uninstaller; deleting them here is not enough.' 'warn'
 }
 
 # ---------------------------------------------------------------- reports
@@ -685,15 +853,9 @@ function Get-KhzWslImages {
     [CmdletBinding()] param()
 
     Write-Khz "`n[wsl] virtual disks" 'head'
-    $roots = @(
-        "$env:LOCALAPPDATA\Packages",
-        "$env:LOCALAPPDATA\Docker\wsl",
-        "$env:LOCALAPPDATA\wsl",
-        "$env:ProgramData\DockerDesktop"
-    )
-
     $found = @()
-    foreach ($r in $roots) {
+    foreach ($r in @("$env:LOCALAPPDATA\Packages", "$env:LOCALAPPDATA\Docker\wsl",
+                     "$env:LOCALAPPDATA\wsl", "$env:ProgramData\DockerDesktop")) {
         if (-not (Test-Path -LiteralPath $r)) { continue }
         $found += @(Get-ChildItem -LiteralPath $r -Recurse -Force -Filter '*.vhdx' -ErrorAction SilentlyContinue)
     }
@@ -703,28 +865,19 @@ function Get-KhzWslImages {
     foreach ($f in ($found | Sort-Object Length -Descending)) {
         Write-Khz ('    {0,10}  {1}' -f (Format-KhzBytes $f.Length), $f.FullName)
     }
-
     Write-Khz ''
-    Write-Khz '    a vhdx never shrinks on its own. To compact:' 'warn'
+    Write-Khz '    a vhdx never shrinks by itself. To compact:' 'warn'
     Write-Khz '      wsl --shutdown'
-    Write-Khz '      Optimize-VHD -Path <file> -Mode Full      # needs Hyper-V module'
-    Write-Khz '      # or: diskpart -> select vdisk file="<file>" -> compact vdisk'
+    Write-Khz '      Optimize-VHD -Path <file> -Mode Full'
 }
 
 function Get-KhzDiskHogs {
-    [CmdletBinding()] param(
-        [string]$Path = $env:SystemDrive,
-        [int]$Top = 20,
-        [int]$Depth = 2
-    )
+    [CmdletBinding()] param([string]$Path = $env:SystemDrive, [int]$Top = 20)
 
     Write-Khz "`n[hogs] largest folders under $Path" 'head'
-
-    $dirs = @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction SilentlyContinue)
-    $rows = foreach ($d in $dirs) {
+    $rows = foreach ($d in @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction SilentlyContinue)) {
         [pscustomobject]@{ Path = $d.FullName; Bytes = (Get-KhzPathSize $d.FullName) }
     }
-
     foreach ($r in (@($rows) | Sort-Object Bytes -Descending | Select-Object -First $Top)) {
         Write-Khz ('    {0,10}  {1}' -f (Format-KhzBytes $r.Bytes), $r.Path)
     }
@@ -743,6 +896,7 @@ function Get-KhzReport {
         UsedGB       = if ($drive) { [math]::Round($drive.Used / 1GB, 2) } else { 0 }
         RamFreeGB    = if ($os) { [math]::Round($os.FreePhysicalMemory / 1MB, 2) } else { 0 }
         RamTotalGB   = if ($os) { [math]::Round($os.TotalVisibleMemorySize / 1MB, 2) } else { 0 }
+        CommitGB     = if ($os) { [math]::Round($os.TotalVirtualMemorySize / 1MB, 2) } else { 0 }
         Processes    = Get-KhzCount (Get-Process -ErrorAction SilentlyContinue)
         StartupItems = Get-KhzCount (Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue)
         GraphModules = Get-KhzCount (Get-Module -ListAvailable Microsoft.Graph* -ErrorAction SilentlyContinue)
@@ -761,12 +915,10 @@ function Register-KhzDailyTask {
     $manifest = Join-Path $PSScriptRoot 'KhzJanitor.psd1'
     $cmd = "Import-Module '$manifest' -Force; Invoke-KhzJanitor -Apply -Quiet -Tasks Logs,Caches,EdgeExtensions"
     $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
-
     $exe = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' }
 
     if (-not $Apply) {
         Write-Khz "    would register 'KhzJanitor Daily' at $At via $exe" 'warn'
-        Write-Khz "    module: $manifest"
         return
     }
 
@@ -782,8 +934,8 @@ function Register-KhzDailyTask {
         -Principal $principal -Settings $settings -Force -Description 'KhzJanitor cleanup' | Out-Null
 
     Write-Khz "    registered 'KhzJanitor Daily' at $At" 'ok'
-    Write-Khz '    note: the SYSTEM account has its own profile, so per-user' 'warn'
-    Write-Khz '    browser caches are only cleared when you run it yourself.' 'warn'
+    Write-Khz '    SYSTEM has its own profile, so per-user browser caches are' 'warn'
+    Write-Khz '    only cleared when you run it yourself.' 'warn'
 }
 
 function Unregister-KhzDailyTask {
@@ -798,7 +950,7 @@ function Invoke-KhzJanitor {
     [CmdletBinding()]
     param(
         [ValidateSet('Logs','Caches','EdgeExtensions','Copilot','Modules','Telemetry',
-                     'Pagefile','Memory','Components','All')]
+                     'Pagefile','Memory','Components','Bloat','Startup','All')]
         [string[]]$Tasks = @('All'),
 
         # Nothing is deleted without this switch.
@@ -813,15 +965,14 @@ function Invoke-KhzJanitor {
     }
 
     New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $log = Join-Path $script:LogDir "khz-$stamp.log"
+    $log = Join-Path $script:LogDir ("khz-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + ".log")
     try { Start-Transcript -Path $log -Force | Out-Null } catch { }
 
     $before = Get-KhzReport
 
     if (-not $Quiet) {
         Write-Khz ''
-        Write-Khz '  KhzJanitor 1.1.0' 'head'
+        Write-Khz '  KhzJanitor 1.2.0' 'head'
         Write-Khz ('  mode: {0}' -f $(if ($Apply) { 'APPLY - deleting' } else { 'DRY RUN - nothing will be deleted' })) `
                   $(if ($Apply) { 'err' } else { 'warn' })
         Write-Khz ('  disk free {0} GB   RAM free {1} of {2} GB   admin {3}' -f
@@ -838,8 +989,10 @@ function Invoke-KhzJanitor {
             'Modules'        { $freed += Remove-KhzStaleModules -Apply:$Apply }
             'Telemetry'      { $freed += Disable-KhzTelemetry -Apply:$Apply }
             'Pagefile'       { $freed += Repair-KhzPagefile -Apply:$Apply }
-            'Memory'         { $freed += Optimize-KhzMemory }
             'Components'     { $freed += Clear-KhzComponentStore -Apply:$Apply -ResetBase:$Aggressive }
+            'Bloat'          { $freed += Remove-KhzBloatware -Apply:$Apply }
+            'Startup'        { Disable-KhzStartup -Apply:$Apply }
+            'Memory'         { Optimize-KhzMemory }
         }
     }
 
@@ -865,5 +1018,6 @@ function Invoke-KhzJanitor {
 Export-ModuleMember -Function Invoke-KhzJanitor, Clear-KhzLogs, Clear-KhzCaches,
     Remove-KhzEdgeExtensions, Disable-KhzCopilot, Remove-KhzStaleModules,
     Disable-KhzTelemetry, Repair-KhzPagefile, Optimize-KhzMemory,
-    Clear-KhzComponentStore, Get-KhzDiskHogs, Get-KhzWslImages,
+    Clear-KhzComponentStore, Remove-KhzBloatware, Disable-KhzStartup,
+    Get-KhzPrograms, Get-KhzDiskHogs, Get-KhzWslImages,
     Register-KhzDailyTask, Unregister-KhzDailyTask, Get-KhzReport
