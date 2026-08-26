@@ -1,0 +1,6 @@
+*.log
+*.csv
+logs/
+TestResults/
+.vs/
+.idea/
