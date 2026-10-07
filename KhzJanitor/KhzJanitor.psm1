@@ -1,6 +1,6 @@
 #requires -Version 5.1
 <#
-    KhzJanitor 1.2.0 - reclaim a bloated Windows box.
+    KhzJanitor 1.2.1 - reclaim a bloated Windows box.
 
     SAFETY CONTRACT
     ---------------
@@ -119,6 +119,54 @@ function Clear-KhzDirectory {
     [pscustomobject]@{ Label = $Label; Bytes = $freed; Skipped = $false }
 }
 
+function Remove-KhzPathMeasured {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Apply
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{ Bytes = 0L; Removed = $false; Skipped = $true }
+    }
+
+    $size = Get-KhzPathSize $Path
+    if (-not $Apply) {
+        return [pscustomobject]@{ Bytes = $size; Removed = $false; Skipped = $false }
+    }
+
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $Path) {
+        $script:Locked++
+        return [pscustomobject]@{ Bytes = 0L; Removed = $false; Skipped = $false }
+    }
+
+    [pscustomobject]@{ Bytes = $size; Removed = $true; Skipped = $false }
+}
+
+function Get-KhzTopmostDirectories {
+    param([object[]]$Directories)
+
+    $selected = @()
+    foreach ($directory in @($Directories | Sort-Object { $_.FullName.Length })) {
+        $full = [IO.Path]::GetFullPath([string]$directory.FullName)
+        $nested = $false
+
+        foreach ($parent in $selected) {
+            $prefix = [IO.Path]::GetFullPath([string]$parent.FullName) + [IO.Path]::DirectorySeparatorChar
+            if ($full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                $nested = $true
+                break
+            }
+        }
+
+        if (-not $nested) {
+            $selected += $directory
+        }
+    }
+
+    @($selected)
+}
+
 function Show-KhzLocked {
     if ($script:Locked -gt 0) {
         Write-Khz "    ($script:Locked items in use or protected - skipped)" 'warn'
@@ -184,11 +232,11 @@ function Clear-KhzLogs {
     }
 
     foreach ($dump in @("$env:SystemRoot\MEMORY.DMP", "$env:SystemRoot\Minidump")) {
-        $size = Get-KhzPathSize $dump
-        if ($size -le 0) { continue }
-        Write-Khz ('    {0,-22} {1}' -f (Split-Path $dump -Leaf), (Format-KhzBytes $size))
-        if ($Apply) { Remove-Item -LiteralPath $dump -Recurse -Force -ErrorAction SilentlyContinue }
-        $total += $size
+        $candidateBytes = Get-KhzPathSize $dump
+        if ($candidateBytes -le 0) { continue }
+        Write-Khz ('    {0,-22} {1}' -f (Split-Path $dump -Leaf), (Format-KhzBytes $candidateBytes))
+        $result = Remove-KhzPathMeasured -Path $dump -Apply:$Apply
+        $total += $result.Bytes
     }
 
     if ($ClearEventLogs) {
@@ -315,15 +363,20 @@ function Clear-KhzCaches {
 
     foreach ($devRoot in @((Join-Path $env:USERPROFILE 'dev'), (Join-Path $env:USERPROFILE 'source'))) {
         if (-not (Test-Path -LiteralPath $devRoot)) { continue }
-        $stale = @(Get-ChildItem -LiteralPath $devRoot -Directory -Recurse -Force -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Name -in @('bin','obj','TestResults','node_modules','target','__pycache__','.pytest_cache') })
+
+        $candidates = @(Get-ChildItem -LiteralPath $devRoot -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -in @('bin','obj','TestResults','node_modules','target','__pycache__','.pytest_cache') })
+        $stale = @(Get-KhzTopmostDirectories -Directories $candidates)
+
         $devBytes = 0L
+        $devCount = 0
         foreach ($d in $stale) {
-            $devBytes += Get-KhzPathSize $d.FullName
-            if ($Apply) { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+            $result = Remove-KhzPathMeasured -Path $d.FullName -Apply:$Apply
+            $devBytes += $result.Bytes
+            if (-not $Apply -or $result.Removed) { $devCount++ }
         }
         if ($devBytes -gt 0) {
-            Write-Khz ('    {0,-22} {1}  ({2} dirs in {3})' -f 'build output', (Format-KhzBytes $devBytes), (Get-KhzCount $stale), (Split-Path $devRoot -Leaf))
+            Write-Khz ('    {0,-22} {1}  ({2} dirs in {3})' -f 'build output', (Format-KhzBytes $devBytes), $devCount, (Split-Path $devRoot -Leaf))
         }
         $total += $devBytes
     }
@@ -469,15 +522,20 @@ function Remove-KhzStaleModules {
         } else { $versions }
 
         foreach ($v in $doomed) {
-            $size = Get-KhzPathSize $v.ModuleBase
-            $total += $size
-            $removed++
-            if (-not $Apply) { continue }
-            Remove-Item -LiteralPath $v.ModuleBase -Recurse -Force -ErrorAction SilentlyContinue
-            if (Test-Path -LiteralPath $v.ModuleBase) {
-                Write-Khz ('    locked  {0} {1}' -f $name, $v.Version) 'warn'
+            $candidateBytes = Get-KhzPathSize $v.ModuleBase
+            $result = Remove-KhzPathMeasured -Path $v.ModuleBase -Apply:$Apply
+            $total += $result.Bytes
+
+            if (-not $Apply) {
+                $removed++
+                continue
+            }
+
+            if ($result.Removed) {
+                $removed++
+                Write-Khz ('    removed {0} {1}  {2}' -f $name, $v.Version, (Format-KhzBytes $candidateBytes)) 'ok'
             } else {
-                Write-Khz ('    removed {0} {1}  {2}' -f $name, $v.Version, (Format-KhzBytes $size)) 'ok'
+                Write-Khz ('    locked  {0} {1}' -f $name, $v.Version) 'warn'
             }
         }
     }
@@ -972,7 +1030,7 @@ function Invoke-KhzJanitor {
 
     if (-not $Quiet) {
         Write-Khz ''
-        Write-Khz '  KhzJanitor 1.2.0' 'head'
+        Write-Khz '  KhzJanitor 1.2.1' 'head'
         Write-Khz ('  mode: {0}' -f $(if ($Apply) { 'APPLY - deleting' } else { 'DRY RUN - nothing will be deleted' })) `
                   $(if ($Apply) { 'err' } else { 'warn' })
         Write-Khz ('  disk free {0} GB   RAM free {1} of {2} GB   admin {3}' -f

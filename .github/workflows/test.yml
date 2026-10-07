@@ -1,0 +1,20 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke test on Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\smoke.ps1
+      - name: Smoke test on PowerShell 7
+        shell: pwsh
+        run: .\tests\smoke.ps1
