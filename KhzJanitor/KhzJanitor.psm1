@@ -187,8 +187,17 @@ function Clear-KhzLogs {
         $size = Get-KhzPathSize $dump
         if ($size -le 0) { continue }
         Write-Khz ('    {0,-22} {1}' -f (Split-Path $dump -Leaf), (Format-KhzBytes $size))
-        if ($Apply) { Remove-Item -LiteralPath $dump -Recurse -Force -ErrorAction SilentlyContinue }
-        $total += $size
+        if (-not $Apply) {
+            $total += $size
+            continue
+        }
+
+        Remove-Item -LiteralPath $dump -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $dump) {
+            $script:Locked++
+        } else {
+            $total += $size
+        }
     }
 
     if ($ClearEventLogs) {
