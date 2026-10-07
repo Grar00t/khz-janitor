@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  powershell-module:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @(
+            '.\KhzJanitor\KhzJanitor.psm1',
+            '.\KhzJanitor\KhzJanitor.psd1',
+            '.\install.ps1'
+          )) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | Format-List *
+              throw "PowerShell parse errors in $path"
+            }
+          }
+      - name: Validate and import module
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = '.\KhzJanitor\KhzJanitor.psd1'
+          $metadata = Test-ModuleManifest $manifest -ErrorAction Stop
+          Import-Module $manifest -Force -ErrorAction Stop
+          $actual = @(Get-Command -Module KhzJanitor | Select-Object -ExpandProperty Name | Sort-Object)
+          $expected = @($metadata.ExportedFunctions.Keys | Sort-Object)
+          if (Compare-Object $expected $actual) {
+            throw "Exported command set does not match the module manifest."
+          }
+          if ($actual.Count -eq 0) {
+            throw "Module imported without exported commands."
+          }
+          Write-Host "EXPORTED_FUNCTIONS=$($actual.Count)"
