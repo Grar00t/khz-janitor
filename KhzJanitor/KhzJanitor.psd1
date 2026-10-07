@@ -1,6 +1,6 @@
 @{
     RootModule        = 'KhzJanitor.psm1'
-    ModuleVersion     = '1.2.0'
+    ModuleVersion     = '1.2.1'
     GUID              = '7b3f9c21-4d8a-4c17-9e6b-1a2f5d8c3e40'
     Author            = 'Suliman Alshammari'
     CompanyName       = 'GraTech'

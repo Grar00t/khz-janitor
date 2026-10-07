@@ -15,7 +15,8 @@ gigabytes of `Microsoft.Graph.*` sub-modules sat unused on disk.
 - Development-artifact cleanup is the deliberate exception: it recursively enumerates only `~/dev` and `~/source`, then removes directories whose **exact directory name** is one of `bin`, `obj`, `TestResults`, `node_modules`, `target`, `__pycache__`, or `.pytest_cache`.
 - It does not perform an unrestricted recursive wildcard deletion from the user profile or an arbitrary caller-supplied root.
 - `Clear-KhzDirectory` removes the contents of a supplied folder, never the folder itself.
-- Files locked by a running process are skipped silently. That is expected.
+- Files locked by a running process are skipped. Applied runs count bytes as reclaimed only after the target is verified absent.
+- Nested build-artifact directories are reduced to topmost deletion roots before sizing, preventing duplicate reclaim estimates.
 - `Invoke-KhzJanitor` writes a transcript to `%ProgramData%\KhzJanitor\logs` and appends a row to `ledger.csv`.
 
 The development-artifact rule is destructive when `-Apply` is present: do not use it if build outputs under `~/dev` or `~/source` must be preserved.
