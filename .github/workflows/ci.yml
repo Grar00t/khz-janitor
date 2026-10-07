@@ -55,6 +55,56 @@ jobs:
           }
           Write-Host "EXPORTED_FUNCTIONS=$($actual.Count)"
 
+      - name: Verify failed deletion is not counted as reclaimed
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module '.\KhzJanitor\KhzJanitor.psd1' -Force -ErrorAction Stop
+
+          $root = Join-Path $env:RUNNER_TEMP 'khz-janitor-locked-delete'
+          Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+
+          $saved = @{
+            SystemRoot   = $env:SystemRoot
+            SystemDrive  = $env:SystemDrive
+            ProgramData  = $env:ProgramData
+            LOCALAPPDATA = $env:LOCALAPPDATA
+          }
+
+          try {
+            $env:SystemRoot = $root
+            $env:SystemDrive = $root
+            $env:ProgramData = $root
+            $env:LOCALAPPDATA = $root
+
+            $dump = Join-Path $root 'MEMORY.DMP'
+            [IO.File]::WriteAllBytes($dump, [byte[]](1..32))
+            $stream = [IO.File]::Open(
+              $dump,
+              [IO.FileMode]::Open,
+              [IO.FileAccess]::ReadWrite,
+              [IO.FileShare]::None
+            )
+            try {
+              $reclaimed = [int64](Clear-KhzLogs -Apply)
+              if ($reclaimed -ne 0) {
+                throw "locked dump was incorrectly counted as reclaimed: $reclaimed"
+              }
+              if (-not (Test-Path -LiteralPath $dump)) {
+                throw 'locked dump unexpectedly disappeared'
+              }
+            } finally {
+              $stream.Dispose()
+            }
+          } finally {
+            $env:SystemRoot = $saved.SystemRoot
+            $env:SystemDrive = $saved.SystemDrive
+            $env:ProgramData = $saved.ProgramData
+            $env:LOCALAPPDATA = $saved.LOCALAPPDATA
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Parse PowerShell sources (PowerShell 7)
         shell: pwsh
         run: |
